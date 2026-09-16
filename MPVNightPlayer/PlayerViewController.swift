@@ -273,8 +273,11 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
 
     private func setString(_ name: String, _ value: String) {
         guard let mpv else { return }
-        let result = value.withCString {
-            mpv_set_property_async(mpv, 0, name, MPV_FORMAT_STRING, UnsafeMutableRawPointer(mutating: $0))
+        let result = value.withCString { bytes -> Int32 in
+            // MPV_FORMAT_STRING takes char **, not the character buffer itself.
+            // libmpv copies the value before this closure returns.
+            var pointer: UnsafePointer<CChar>? = bytes
+            return mpv_set_property_async(mpv, 0, name, MPV_FORMAT_STRING, &pointer)
         }
         if result < 0 { showMPVError(result, operation: name) }
     }

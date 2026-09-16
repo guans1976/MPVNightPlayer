@@ -50,7 +50,7 @@ jobs:
           APP=build/DerivedData/Build/Products/Release-iphoneos/MPVNightPlayer.app
           test -x "$APP/MPVNightPlayer"
           /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
-          xcrun lipo -verify_arch arm64 "$APP/MPVNightPlayer"
+          xcrun lipo "$APP/MPVNightPlayer" -verify_arch arm64
           otool -L "$APP/MPVNightPlayer" | tee linked-libraries.txt
           mkdir -p build/ipa/Payload
           ditto "$APP" build/ipa/Payload/MPVNightPlayer.app
