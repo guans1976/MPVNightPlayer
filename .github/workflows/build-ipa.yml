@@ -1,0 +1,80 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Xcode version
+        run: xcodebuild -version
+      - name: Resolve pinned MPVKit
+        run: |
+          set -o pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project MPVNightPlayer.xcodeproj \
+            -scheme MPVNightPlayer \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -onlyUsePackageVersionsFromResolvedFile 2>&1 | tee resolve.log
+      - name: Build unsigned iPhone app
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project MPVNightPlayer.xcodeproj \
+            -scheme MPVNightPlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -disableAutomaticPackageResolution \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" ARCHS=arm64 \
+            2>&1 | tee build.log
+      - name: Verify and package IPA
+        run: |
+          set -euo pipefail
+          APP=build/DerivedData/Build/Products/Release-iphoneos/MPVNightPlayer.app
+          test -x "$APP/MPVNightPlayer"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
+          xcrun lipo -verify_arch arm64 "$APP/MPVNightPlayer"
+          otool -L "$APP/MPVNightPlayer" | tee linked-libraries.txt
+          mkdir -p build/ipa/Payload
+          ditto "$APP" build/ipa/Payload/MPVNightPlayer.app
+          cd build/ipa
+          /usr/bin/zip -qry MPVNightPlayer-unsigned.ipa Payload
+          unzip -t MPVNightPlayer-unsigned.ipa
+          shasum -a 256 MPVNightPlayer-unsigned.ipa > SHA256SUMS.txt
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MPVNightPlayer-unsigned
+          path: |
+            build/ipa/MPVNightPlayer-unsigned.ipa
+            build/ipa/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            resolve.log
+            build.log
+            linked-libraries.txt
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,3 +1,47 @@
 # MPV Night Player
 
-iOS local video player built with MPVKit 1.0.0, libmpv and Metal. Minimum iOS 15; intended for iOS 16.4 and TrollStore.
+面向 iPhone / iPad 的本地视频播放器，最低 iOS 15，目标测试系统 iOS 16.4。使用 **MPVKit 1.0.0**（固定版本）、libmpv、gpu-next 和 MoltenVK/Metal。
+
+## 第一版功能
+- UIDocumentPicker 打开 MP4、MOV、MKV 等本地视频，包括文件提供商中的文件。
+- 播放、暂停、播完重播；后台自动暂停，耳机拔出时暂停。
+- Brightness、Gamma、Contrast、Saturation 实时调整（mpv 原生 -100…100，默认 0）。
+- Reset 一键恢复；横屏左右布局，竖屏上下布局，控制面板可滚动。
+- 解码或文件访问失败时显示错误。支持的实际编码取决于 MPVKit/FFmpeg。
+- 参数改变视频画面，不改变系统屏幕亮度。本版未加入去噪/锐化。
+
+## 下载和安装
+1. 打开 [Actions](https://github.com/guans1976/MPVNightPlayer/actions/workflows/build-ipa.yml)，选择成功的运行。
+2. 下载 **MPVNightPlayer-unsigned** artifact，解压 ZIP。
+3. 在已安装 TrollStore 的兼容设备上，用 TrollStore 打开 `MPVNightPlayer-unsigned.ipa`。
+4. 打开应用，点 **Open Video / 打开**，选择视频并调整滑块。
+
+IPA 未使用 Apple 开发者证书签名；TrollStore 在安装时处理签名。此构建不需要私有权限、越狱权限或开发者账号。编译成功不能替代 iOS 16.4 真机测试。
+
+## 构建
+在 macOS 上用 Xcode 16 或更新版本打开 `MPVNightPlayer.xcodeproj`，选择 **MPVNightPlayer** scheme。Swift Package Manager 自动获取固定的 MPVKit 1.0.0 二进制依赖。
+
+```sh
+xcodebuild build -project MPVNightPlayer.xcodeproj -scheme MPVNightPlayer \
+  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+  -derivedDataPath build/DerivedData \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ARCHS=arm64
+mkdir -p build/ipa/Payload
+ditto build/DerivedData/Build/Products/Release-iphoneos/MPVNightPlayer.app build/ipa/Payload/MPVNightPlayer.app
+(cd build/ipa && zip -qry MPVNightPlayer-unsigned.ipa Payload)
+```
+
+GitHub Actions 在 macos-15 上执行依赖解析、无签名 iphoneos 构建、arm64 检查、IPA ZIP 完整性检查，并上传 IPA、SHA-256 校验和与构建日志。可手动 Run workflow，也会在 main 推送时自动执行。
+
+## 真机验收清单
+- iOS 16.4 + TrollStore 安装并启动。
+- 从“我的 iPhone”打开 MP4/MOV/MKV；也测试文件名带中文、空格。
+- 暂停/继续/重播；拖动四个滑块时画面实时变化；Reset 后均为 0。
+- 播放和暂停时分别旋转横竖屏；面板滚动时按钮均可访问。
+- 打开第二个文件；取消文件选择；选择不支持的文件时显示错误。
+- 锁屏/返回、来电中断、耳机拔出；返回前台后由用户按 Play 继续。
+- 测试文件提供商/iCloud 文件的访问权限和下载等待。
+- HDR、4K、高码率视频的画面/音画同步/性能需要真机确认。
+
+## 第三方依赖
+采用 MPVKit 的非 GPL 产品 `MPVKit`。Metal 接入方式参考 [MPVKit 官方 iOS Demo](https://github.com/mpvkit/MPVKit/tree/1.0.0/Demo/Demo-iOS)，本仓库应用代码为独立实现。MPVKit/libmpv 及 FFmpeg 等组件保留各自许可证；对应源码、构建脚本和组件版本见 [MPVKit 1.0.0](https://github.com/mpvkit/MPVKit/tree/1.0.0) 与其 [LICENSE](https://github.com/mpvkit/MPVKit/blob/1.0.0/LICENSE)。本仓库提供完整应用源码，允许重新构建和替换依赖。
