@@ -944,7 +944,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         vec4 c = HOOKED_tex(HOOKED_pos);
         float y = max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0);
         float mask = 1.0 - smoothstep(0.05, 0.65, y);
-        float gain = 1.0 + 1.4 * night_shadow * mask;
+        float gain = 1.0 + 1.0 * night_shadow * mask;
         return vec4(c.rgb * gain, c.a);
     }
     """
