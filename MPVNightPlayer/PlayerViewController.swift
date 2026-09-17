@@ -25,6 +25,7 @@ final class VideoView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
+        videoLayer.contentsGravity = .resizeAspect
         videoLayer.contentsScale = scale
         videoLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
     }
@@ -51,6 +52,18 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     private let fullscreenHUD = UIStackView()
     private let fullscreenPlayButton = UIButton(type: .system)
     private var hideHUDTimer: Timer?
+    private let scaleButton = UIButton(type: .system)
+    private var fillScreen = true
+    private var progressSliders: [UISlider] = []
+    private var timeLabels: [UILabel] = []
+    private var duration: Double = 0
+    private var position: Double = 0
+    private var seekable = false
+    private var scrubbing = false
+    private var waitingForSeek = false
+    private var resizeWork: DispatchWorkItem?
+    private var resizingVideo = false
+    private var renderedSize = CGSize.zero
     private var mpv: OpaquePointer?
     private var timer: Timer?
     private var hasFile = false
@@ -124,7 +137,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             controls.widthAnchor.constraint(equalTo: panel.frameLayoutGuide.widthAnchor, constant: -32)
         ])
         let title = UILabel()
-        title.text = "MPV Night Player 1.0.3"
+        title.text = "MPV Night Player 1.0.4"
         title.font = .systemFont(ofSize: 22, weight: .bold)
         controls.addArrangedSubview(title)
         filename.text = "打开本地视频，调整暗部与色彩"
@@ -150,6 +163,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             buttons.addArrangedSubview(button)
         }
         controls.addArrangedSubview(buttons)
+        controls.addArrangedSubview(makeTimeline())
         photosButton.setTitle("Photos / 从相册选择视频", for: .normal)
         photosButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
         photosButton.addTarget(self, action: #selector(openPhotos), for: .touchUpInside)
@@ -231,9 +245,9 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     }
 
     private func buildFullscreenHUD() {
-        fullscreenHUD.axis = .horizontal
+        fullscreenHUD.axis = .vertical
         fullscreenHUD.spacing = 12
-        fullscreenHUD.distribution = .fillEqually
+        fullscreenHUD.distribution = .fill
         fullscreenHUD.backgroundColor = UIColor.black.withAlphaComponent(0.7)
         fullscreenHUD.layer.cornerRadius = 12
         fullscreenHUD.isLayoutMarginsRelativeArrangement = true
@@ -244,17 +258,25 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         exitButton.accessibilityLabel = "退出全屏并显示画面调节菜单"
         exitButton.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
         fullscreenPlayButton.addTarget(self, action: #selector(fullscreenTogglePlay), for: .touchUpInside)
-        for button in [exitButton, fullscreenPlayButton] {
+        let buttonRow = UIStackView()
+        buttonRow.axis = .horizontal
+        buttonRow.spacing = 8
+        buttonRow.distribution = .fillEqually
+        scaleButton.setTitle("铺满 · 切换", for: .normal)
+        scaleButton.addTarget(self, action: #selector(toggleScaleMode), for: .touchUpInside)
+        for button in [exitButton, fullscreenPlayButton, scaleButton] {
             button.tintColor = .white
             button.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
             button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
-            fullscreenHUD.addArrangedSubview(button)
+            buttonRow.addArrangedSubview(button)
         }
+        fullscreenHUD.addArrangedSubview(buttonRow)
+        fullscreenHUD.addArrangedSubview(makeTimeline())
         view.addSubview(fullscreenHUD)
         NSLayoutConstraint.activate([
-            fullscreenHUD.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            fullscreenHUD.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
-            fullscreenHUD.widthAnchor.constraint(equalToConstant: 280)
+            fullscreenHUD.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            fullscreenHUD.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            fullscreenHUD.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12)
         ])
         fullscreenHUD.isHidden = true
         let tap = UITapGestureRecognizer(target: self, action: #selector(videoTapped))
@@ -270,9 +292,11 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         setNeedsStatusBarAppearanceUpdate()
         setFullscreenHUDVisible(isFullscreen)
         view.layoutIfNeeded()
-        // Resize the existing Metal surface without reloading or restarting playback.
+        applyScaleMode()
+        // Refresh the MPVKit output after the new Metal surface size is committed.
         video.setNeedsLayout()
         video.layoutIfNeeded()
+        scheduleVideoResize()
     }
 
     @objc private func videoTapped() {
@@ -294,10 +318,126 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         fullscreenHUD.isHidden = !isFullscreen || !visible
         setNeedsUpdateOfHomeIndicatorAutoHidden()
         // Keep controls available to VoiceOver users.
-        guard isFullscreen, visible, !UIAccessibility.isVoiceOverRunning else { return }
+        guard isFullscreen, visible, !scrubbing, !isPaused, !UIAccessibility.isVoiceOverRunning else { return }
         hideHUDTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
             self?.setFullscreenHUDVisible(false)
         }
+    }
+
+    private func makeTimeline() -> UIView {
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 2
+        let label = UILabel()
+        label.text = "00:00 / --:--"
+        label.textColor = .white
+        label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        let slider = UISlider()
+        slider.minimumValue = 0
+        slider.maximumValue = 1
+        slider.isEnabled = false
+        slider.accessibilityLabel = "播放进度"
+        slider.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        slider.addTarget(self, action: #selector(seekBegan(_:)), for: .touchDown)
+        slider.addTarget(self, action: #selector(seekChanged(_:)), for: .valueChanged)
+        slider.addTarget(self, action: #selector(seekEnded(_:)), for: [.touchUpInside, .touchUpOutside])
+        slider.addTarget(self, action: #selector(seekCancelled(_:)), for: .touchCancel)
+        stack.addArrangedSubview(label)
+        stack.addArrangedSubview(slider)
+        progressSliders.append(slider)
+        timeLabels.append(label)
+        return stack
+    }
+
+    private func clockText(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "--:--" }
+        let value = Int(min(seconds, Double(Int32.max)))
+        if value >= 3600 {
+            return String(format: "%d:%02d:%02d", value / 3600, value / 60 % 60, value % 60)
+        }
+        return String(format: "%02d:%02d", value / 60, value % 60)
+    }
+
+    private func updateTimeline(preview: Double? = nil) {
+        let current = preview ?? position
+        let text = clockText(current) + " / " + (duration > 0 ? clockText(duration) : "--:--")
+        for label in timeLabels { label.text = text }
+        for slider in progressSliders {
+            slider.isEnabled = hasFile && seekable && duration > 0
+            if !scrubbing && !waitingForSeek {
+                slider.value = duration > 0 ? Float(min(max(position / duration, 0), 1)) : 0
+            }
+            slider.accessibilityValue = text
+        }
+    }
+
+    @objc private func seekBegan(_ slider: UISlider) {
+        scrubbing = true
+        hideHUDTimer?.invalidate()
+        hideHUDTimer = nil
+    }
+
+    @objc private func seekChanged(_ slider: UISlider) {
+        // VoiceOver changes slider values without touch-down/up events.
+        if !slider.isTracking && !scrubbing { seekEnded(slider); return }
+        updateTimeline(preview: Double(slider.value) * duration)
+    }
+
+    @objc private func seekEnded(_ slider: UISlider) {
+        scrubbing = false
+        guard hasFile, seekable, duration > 0 else { updateTimeline(); return }
+        let target = min(max(Double(slider.value) * duration, 0), duration)
+        waitingForSeek = true
+        if !command(["seek", String(target), "absolute+exact"], replyID: 2001) {
+            waitingForSeek = false
+        }
+        position = target
+        for other in progressSliders { other.value = slider.value }
+        updateTimeline(preview: target)
+        if isFullscreen { setFullscreenHUDVisible(true) }
+    }
+
+    @objc private func seekCancelled(_ slider: UISlider) {
+        scrubbing = false
+        updateTimeline()
+        if isFullscreen { setFullscreenHUDVisible(true) }
+    }
+
+    @objc private func toggleScaleMode() {
+        fillScreen.toggle()
+        applyScaleMode()
+        setFullscreenHUDVisible(true)
+    }
+
+    private func applyScaleMode() {
+        scaleButton.setTitle(fillScreen ? "铺满 · 切换" : "完整 · 切换", for: .normal)
+        setString("keepaspect", "yes")
+        setString("video-unscaled", "no")
+        setString("panscan", isFullscreen && fillScreen ? "1" : "0")
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        video.layoutIfNeeded()
+        scheduleVideoResize()
+    }
+
+    private func scheduleVideoResize() {
+        guard hasFile, !backgrounded, !resizingVideo else { return }
+        let size = video.videoLayer.drawableSize
+        guard size.width > 1, size.height > 1, size != renderedSize else { return }
+        resizeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.hasFile, !self.backgrounded, !self.resizingVideo else { return }
+            self.renderedSize = self.video.videoLayer.drawableSize
+            self.resizingVideo = true
+            // MPVKit 1.0.0's moltenvk context only reads drawableSize at reconfiguration.
+            // Re-select video after the disable reply, preserving the current audio,
+            // playback position and pause state instead of reloading the file.
+            if !self.setString("vid", "no", replyID: 1001) { self.resizingVideo = false }
+        }
+        resizeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     private func updateLayout(for size: CGSize, force: Bool = false) {
@@ -328,7 +468,9 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         let options = [
             ("vo", "gpu-next"), ("gpu-api", "vulkan"), ("gpu-context", "moltenvk"),
             ("hwdec", "videotoolbox"), ("keep-open", "yes"), ("idle", "yes"),
-            ("target-colorspace-hint", "no"), ("input-default-bindings", "no")
+            ("target-colorspace-hint", "no"), ("input-default-bindings", "no"),
+            ("keepaspect", "yes"), ("video-unscaled", "no"),
+            ("panscan", isFullscreen && fillScreen ? "1" : "0")
         ]
         for (name, value) in options where result >= 0 {
             result = mpv_set_option_string(handle, name, value)
@@ -345,6 +487,9 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         mpv_request_log_messages(handle, "warn")
         mpv_observe_property(handle, 1, "pause", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 2, "eof-reached", MPV_FORMAT_FLAG)
+        mpv_observe_property(handle, 3, "time-pos", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 4, "duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 5, "seekable", MPV_FORMAT_FLAG)
         // Drain on the main run loop: no C callbacks can outlive this controller.
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.readEvents() }
         RunLoop.main.add(timer, forMode: .common)
@@ -486,6 +631,15 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     private func finishImport(_ url: URL, name: String) {
         importInProgress = false
         importProgress = nil
+        resizeWork?.cancel()
+        resizingVideo = false
+        renderedSize = .zero
+        duration = 0
+        position = 0
+        seekable = false
+        scrubbing = false
+        waitingForSeek = false
+        updateTimeline()
         // Stop the old reader before deleting its imported file.
         timer?.invalidate()
         timer = nil
@@ -515,32 +669,33 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     @objc private func showDiagnostics() {
         let details = ([playbackError].compactMap { $0 } + recentErrors).joined(separator: "\n")
         let message = details.isEmpty ? (status.text ?? "尚未记录错误") : details
-        let alert = UIAlertController(title: "播放诊断 · 1.0.3", message: message, preferredStyle: .alert)
+        let alert = UIAlertController(title: "播放诊断 · 1.0.4", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "复制", style: .default) { _ in UIPasteboard.general.string = message })
         alert.addAction(UIAlertAction(title: "关闭", style: .cancel))
         present(alert, animated: true)
     }
 
-    @discardableResult private func command(_ arguments: [String]) -> Bool {
+    @discardableResult private func command(_ arguments: [String], replyID: UInt64 = 0) -> Bool {
         guard let mpv else { return false }
         let allocated = arguments.map { strdup($0) }
         defer { allocated.forEach { free($0) } }
         var pointers: [UnsafePointer<CChar>?] = allocated.map { $0.map { UnsafePointer<CChar>($0) } }
         pointers.append(nil)
-        let result = mpv_command_async(mpv, 0, &pointers)
+        let result = mpv_command_async(mpv, replyID, &pointers)
         if result < 0 { showMPVError(result, operation: "播放命令") }
         return result >= 0
     }
 
-    private func setString(_ name: String, _ value: String) {
-        guard let mpv else { return }
+    @discardableResult private func setString(_ name: String, _ value: String, replyID: UInt64 = 0) -> Bool {
+        guard let mpv else { return false }
         let result = value.withCString { bytes -> Int32 in
             // MPV_FORMAT_STRING takes char **, not the character buffer itself.
             // libmpv copies the value before this closure returns.
             var pointer: UnsafePointer<CChar>? = bytes
-            return mpv_set_property_async(mpv, 0, name, MPV_FORMAT_STRING, &pointer)
+            return mpv_set_property_async(mpv, replyID, name, MPV_FORMAT_STRING, &pointer)
         }
         if result < 0 { showMPVError(result, operation: name) }
+        return result >= 0
     }
 
     @objc private func togglePlay() {
@@ -583,6 +738,8 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             switch event.event_id {
             case MPV_EVENT_FILE_LOADED:
                 hasFile = true
+                renderedSize = video.videoLayer.drawableSize
+                updateTimeline()
                 setString("pause", backgrounded ? "yes" : "no")
                 filename.text = pendingName
                 status.text = "已打开 · 实时调节画面，Reset 恢复为 0"
@@ -592,14 +749,30 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             case MPV_EVENT_PROPERTY_CHANGE:
                 guard let data = event.data else { continue }
                 let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
-                guard property.format == MPV_FORMAT_FLAG, let value = property.data else { continue }
-                let flag = value.assumingMemoryBound(to: CInt.self).pointee != 0
-                switch String(cString: property.name) {
-                case "pause": isPaused = flag
-                case "eof-reached": reachedEnd = flag
-                default: break
+                let name = String(cString: property.name)
+                if property.format == MPV_FORMAT_DOUBLE, let value = property.data {
+                    let number = value.assumingMemoryBound(to: Double.self).pointee
+                    if number.isFinite {
+                        if name == "duration" { duration = max(0, number) }
+                        if name == "time-pos" && !waitingForSeek { position = max(0, number) }
+                    }
+                    if !scrubbing && !waitingForSeek { updateTimeline() }
+                } else if property.format == MPV_FORMAT_FLAG, let value = property.data {
+                    let flag = value.assumingMemoryBound(to: CInt.self).pointee != 0
+                    switch name {
+                    case "pause":
+                        isPaused = flag
+                        if isFullscreen && flag { setFullscreenHUDVisible(true) }
+                    case "eof-reached": reachedEnd = flag
+                    case "seekable": seekable = flag
+                    default: break
+                    }
+                    updatePlayButton()
+                    if !scrubbing { updateTimeline() }
                 }
-                updatePlayButton()
+            case MPV_EVENT_PLAYBACK_RESTART:
+                waitingForSeek = false
+                updateTimeline()
             case MPV_EVENT_LOG_MESSAGE:
                 guard let data = event.data else { continue }
                 let message = data.assumingMemoryBound(to: mpv_event_log_message.self).pointee
@@ -611,11 +784,27 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
                 let end = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
                 if end.reason == MPV_END_FILE_REASON_ERROR {
                     hasFile = false
+                    updateTimeline()
                     showMPVError(end.error, operation: "无法播放此文件")
                     updatePlayButton()
                 }
-            case MPV_EVENT_COMMAND_REPLY, MPV_EVENT_SET_PROPERTY_REPLY:
-                if event.error < 0 { showMPVError(event.error, operation: "播放/画面设置") }
+            case MPV_EVENT_SET_PROPERTY_REPLY:
+                if event.reply_userdata == 1001 {
+                    if !backgrounded {
+                        if !setString("vid", "auto", replyID: 1002) { resizingVideo = false }
+                    }
+                    else { resizingVideo = false }
+                } else if event.reply_userdata == 1002 {
+                    resizingVideo = false
+                    scheduleVideoResize()
+                }
+                if event.error < 0 { showMPVError(event.error, operation: "画面设置") }
+            case MPV_EVENT_COMMAND_REPLY:
+                if event.reply_userdata == 2001 && event.error < 0 {
+                    waitingForSeek = false
+                    updateTimeline()
+                }
+                if event.error < 0 { showMPVError(event.error, operation: "播放命令") }
             default: break
             }
         }
@@ -623,6 +812,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
 
     @objc private func enterBackground() {
         backgrounded = true
+        resizeWork?.cancel()
         setString("pause", "yes")
         setString("vid", "no")
         updatePlayButton()
@@ -672,6 +862,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     }
 
     deinit {
+        resizeWork?.cancel()
         hideHUDTimer?.invalidate()
         timer?.invalidate()
         NotificationCenter.default.removeObserver(self)
