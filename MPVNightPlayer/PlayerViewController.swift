@@ -1,6 +1,7 @@
 import UIKit
 import AVFoundation
 import UniformTypeIdentifiers
+import PhotosUI
 import Metal
 import Libmpv
 
@@ -29,11 +30,12 @@ final class VideoView: UIView {
     }
 }
 
-final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
+final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PHPickerViewControllerDelegate {
     private let video = VideoView()
     private let panel = UIScrollView()
     private let controls = UIStackView()
     private let openButton = UIButton(type: .system)
+    private let photosButton = UIButton(type: .system)
     private let playButton = UIButton(type: .system)
     private let status = UILabel()
     private let filename = UILabel()
@@ -52,9 +54,11 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
     private var backgrounded = false
     private var resumeAfterInterruption = false
     private var pendingName = ""
-    // Keep access while libmpv may still be reading a replaced file.
-    // All scopes are balanced when the player shuts down.
-    private var scopedURLs: [URL] = []
+    private var importInProgress = false
+    private var importProgress: Progress?
+    private var recentErrors: [String] = []
+    private var importDirectory: URL?
+    private var playbackError: String?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -107,7 +111,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
             controls.widthAnchor.constraint(equalTo: panel.frameLayoutGuide.widthAnchor, constant: -32)
         ])
         let title = UILabel()
-        title.text = "MPV Night Player"
+        title.text = "MPV Night Player 1.0.1"
         title.font = .systemFont(ofSize: 22, weight: .bold)
         controls.addArrangedSubview(title)
         filename.text = "打开本地视频，调整暗部与色彩"
@@ -128,6 +132,14 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
             buttons.addArrangedSubview(button)
         }
         controls.addArrangedSubview(buttons)
+        photosButton.setTitle("Photos / 从相册选择视频", for: .normal)
+        photosButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        photosButton.addTarget(self, action: #selector(openPhotos), for: .touchUpInside)
+        controls.addArrangedSubview(photosButton)
+        let diagnostics = UIButton(type: .system)
+        diagnostics.setTitle("查看播放错误", for: .normal)
+        diagnostics.addTarget(self, action: #selector(showDiagnostics), for: .touchUpInside)
+        controls.addArrangedSubview(diagnostics)
         for index in properties.indices {
             let row = UIStackView()
             row.axis = .horizontal
@@ -207,6 +219,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
         guard video.videoLayer.device != nil, let handle = mpv_create() else {
             showError("无法初始化 Metal / libmpv 播放器")
             openButton.isEnabled = false
+            photosButton.isEnabled = false
             return
         }
         mpv = handle
@@ -227,8 +240,10 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
             mpv_terminate_destroy(handle)
             mpv = nil
             openButton.isEnabled = false
+            photosButton.isEnabled = false
             return
         }
+        mpv_request_log_messages(handle, "warn")
         mpv_observe_property(handle, 1, "pause", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 2, "eof-reached", MPV_FORMAT_FLAG)
         // Drain on the main run loop: no C callbacks can outlive this controller.
@@ -245,19 +260,133 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
         present(picker, animated: true)
     }
 
-    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        guard let url = urls.first, mpv != nil else { return }
-        if url.startAccessingSecurityScopedResource() { scopedURLs.append(url) }
-        configureAudio()
-        pendingName = url.lastPathComponent
-        status.text = "正在打开 \(pendingName)…"
-        status.textColor = .secondaryLabel
-        hasFile = false
-        reachedEnd = false
-        updatePlayButton()
-        if command(["loadfile", url.path, "replace"]) {
-            setString("pause", "no")
+    @objc private func openPhotos() {
+        guard !importInProgress else { return }
+        var configuration = PHPickerConfiguration()
+        configuration.filter = .videos
+        configuration.selectionLimit = 1
+        configuration.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: configuration)
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard let provider = results.first?.itemProvider else { return }
+        guard provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) else {
+            showError("所选项目未提供视频文件")
+            return
         }
+        beginImport("正在从相册导入；iCloud 视频可能需要下载…")
+        importProgress = provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { [weak self] url, error in
+            guard let self else { return }
+            do {
+                if let error { throw error }
+                guard let url else { throw CocoaError(.fileReadUnknown) }
+                // Copy before the provider deletes its temporary URL on callback return.
+                let imported = try Self.copyForPlayback(url)
+                DispatchQueue.main.async { self.finishImport(imported, name: provider.suggestedName ?? url.lastPathComponent) }
+            } catch {
+                DispatchQueue.main.async { self.importFailed(error) }
+            }
+        }
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        guard let url = urls.first, mpv != nil, !importInProgress else { return }
+        beginImport("正在导入视频；大文件或云端文件可能需要稍候…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            var coordinationError: NSError?
+            var imported: Result<URL, Error>?
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readableURL in
+                imported = Result { try Self.copyForPlayback(readableURL) }
+            }
+            let result = imported ?? .failure(coordinationError ?? NSError(domain: NSCocoaErrorDomain,
+                code: CocoaError.fileReadUnknown.rawValue))
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let local): self.finishImport(local, name: url.lastPathComponent)
+                case .failure(let error): self.importFailed(error)
+                }
+            }
+        }
+    }
+
+    nonisolated private static func copyForPlayback(_ source: URL) throws -> URL {
+        let fm = FileManager.default
+        let directory = fm.temporaryDirectory.appendingPathComponent("MPVImport-" + UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent(source.lastPathComponent)
+        do {
+            try fm.copyItem(at: source, to: destination)
+            let attributes = try fm.attributesOfItem(atPath: destination.path)
+            guard ((attributes[.size] as? NSNumber)?.int64Value ?? 0) > 0 else {
+                throw NSError(domain: "MPVNightPlayer", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "视频文件为空，请先完成云端下载"])
+            }
+            return destination
+        } catch {
+            try? fm.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    private func beginImport(_ message: String) {
+        importInProgress = true
+        openButton.isEnabled = false
+        photosButton.isEnabled = false
+        status.text = message
+        status.textColor = .secondaryLabel
+    }
+
+    private func importFailed(_ error: Error) {
+        importInProgress = false
+        importProgress = nil
+        openButton.isEnabled = mpv != nil
+        photosButton.isEnabled = mpv != nil
+        showError("导入失败：\(error.localizedDescription)")
+    }
+
+    private func finishImport(_ url: URL, name: String) {
+        importInProgress = false
+        importProgress = nil
+        // Stop the old reader before deleting its imported file.
+        timer?.invalidate()
+        timer = nil
+        if let handle = mpv { mpv_terminate_destroy(handle) }
+        mpv = nil
+        if let directory = importDirectory { try? FileManager.default.removeItem(at: directory) }
+        importDirectory = url.deletingLastPathComponent()
+        hasFile = false
+        isPaused = true
+        reachedEnd = false
+        playbackError = nil
+        recentErrors.removeAll()
+        view.layoutIfNeeded()
+        video.layoutIfNeeded()
+        setupPlayer()
+        openButton.isEnabled = mpv != nil
+        photosButton.isEnabled = mpv != nil
+        guard mpv != nil else { return }
+        configureAudio()
+        pendingName = name
+        status.text = "正在打开 \(name)…"
+        status.textColor = .secondaryLabel
+        updatePlayButton()
+        command(["loadfile", url.path, "replace"])
+    }
+
+    @objc private func showDiagnostics() {
+        let details = ([playbackError].compactMap { $0 } + recentErrors).joined(separator: "\n")
+        let message = details.isEmpty ? (status.text ?? "尚未记录错误") : details
+        let alert = UIAlertController(title: "播放诊断 · 1.0.1", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "复制", style: .default) { _ in UIPasteboard.general.string = message })
+        alert.addAction(UIAlertAction(title: "关闭", style: .cancel))
+        present(alert, animated: true)
     }
 
     @discardableResult private func command(_ arguments: [String]) -> Bool {
@@ -320,6 +449,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
             switch event.event_id {
             case MPV_EVENT_FILE_LOADED:
                 hasFile = true
+                setString("pause", backgrounded ? "yes" : "no")
                 filename.text = pendingName
                 status.text = "已打开 · 实时调节画面，Reset 恢复为 0"
                 status.textColor = .secondaryLabel
@@ -336,6 +466,12 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
                 default: break
                 }
                 updatePlayButton()
+            case MPV_EVENT_LOG_MESSAGE:
+                guard let data = event.data else { continue }
+                let message = data.assumingMemoryBound(to: mpv_event_log_message.self).pointee
+                let text = String(cString: message.text).trimmingCharacters(in: .whitespacesAndNewlines)
+                recentErrors.append(String(cString: message.prefix) + ": " + text)
+                if recentErrors.count > 12 { recentErrors.removeFirst() }
             case MPV_EVENT_END_FILE:
                 guard let data = event.data else { continue }
                 let end = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
@@ -395,7 +531,8 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
     }
 
     private func showError(_ message: String) {
-        status.text = message
+        playbackError = message
+        status.text = message + "（可点“查看播放错误”复制详情）"
         status.textColor = .systemOrange
     }
 
@@ -403,7 +540,8 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate {
         timer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         if let mpv { mpv_terminate_destroy(mpv) }
-        scopedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+        importProgress?.cancel()
+        if let directory = importDirectory { try? FileManager.default.removeItem(at: directory) }
         UIApplication.shared.isIdleTimerDisabled = false
     }
 }

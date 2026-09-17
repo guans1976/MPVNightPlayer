@@ -2,7 +2,15 @@
 
 面向 iPhone / iPad 的本地视频播放器，最低 iOS 15，目标测试系统 iOS 16.4。使用 **MPVKit 1.0.0**（固定版本）、libmpv、gpu-next 和 MoltenVK/Metal。
 
-## 第一版功能
+## 1.0.1 更新
+- 新增 Photos 相册视频选择器，无需授予整个相册的读取权限。
+- 文件通过协调读取复制到应用临时目录后播放，相册临时文件在回调结束前保存。
+- 导入在后台进行；替换视频后删除上一份导入副本，需要预留视频大小的空间。
+- 加载完成后再启动播放，避免加载与暂停状态的异步竞态。
+- 新增“查看播放错误”，可复制底层警告/错误，便于真机排查。
+- 尚未取得用户原始播放故障的错误详情，不能将编译通过视为真机问题已经解决。
+
+## 功能
 - UIDocumentPicker 打开 MP4、MOV、MKV 等本地视频，包括文件提供商中的文件。
 - 播放、暂停、播完重播；后台自动暂停，耳机拔出时暂停。
 - Brightness、Gamma、Contrast、Saturation 实时调整（mpv 原生 -100…100，默认 0）。
@@ -14,7 +22,7 @@
 1. 打开 [Actions](https://github.com/guans1976/MPVNightPlayer/actions/workflows/build-ipa.yml)，选择成功的运行。
 2. 下载 **MPVNightPlayer-unsigned** artifact，解压 ZIP。
 3. 在已安装 TrollStore 的兼容设备上，用 TrollStore 打开 `MPVNightPlayer-unsigned.ipa`。
-4. 打开应用，点 **Open Video / 打开**，选择视频并调整滑块。
+4. 打开应用，点 **Open Video / 打开**，选择视频并调整滑块；也可点 **Photos / 从相册选择视频**。
 
 IPA 未使用 Apple 开发者证书签名；TrollStore 在安装时处理签名。此构建不需要私有权限、越狱权限或开发者账号。编译成功不能替代 iOS 16.4 真机测试。
 
