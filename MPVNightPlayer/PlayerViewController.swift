@@ -46,6 +46,11 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     private var portrait: [NSLayoutConstraint] = []
     private var landscape: [NSLayoutConstraint] = []
     private var isWide: Bool?
+    private var fullscreenConstraints: [NSLayoutConstraint] = []
+    private var isFullscreen = false
+    private let fullscreenHUD = UIStackView()
+    private let fullscreenPlayButton = UIButton(type: .system)
+    private var hideHUDTimer: Timer?
     private var mpv: OpaquePointer?
     private var timer: Timer?
     private var hasFile = false
@@ -78,6 +83,14 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
     override var shouldAutorotate: Bool { true }
+    override var prefersStatusBarHidden: Bool { isFullscreen }
+    override var prefersHomeIndicatorAutoHidden: Bool { isFullscreen && fullscreenHUD.isHidden }
+
+    override func accessibilityPerformEscape() -> Bool {
+        guard isFullscreen else { return false }
+        toggleFullscreen()
+        return true
+    }
 
     private func configureAudio() {
         do {
@@ -111,7 +124,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             controls.widthAnchor.constraint(equalTo: panel.frameLayoutGuide.widthAnchor, constant: -32)
         ])
         let title = UILabel()
-        title.text = "MPV Night Player 1.0.2"
+        title.text = "MPV Night Player 1.0.3"
         title.font = .systemFont(ofSize: 22, weight: .bold)
         controls.addArrangedSubview(title)
         filename.text = "打开本地视频，调整暗部与色彩"
@@ -119,6 +132,11 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         filename.textColor = .secondaryLabel
         filename.numberOfLines = 2
         controls.addArrangedSubview(filename)
+        let fullscreenButton = UIButton(type: .system)
+        fullscreenButton.setTitle("⛶ 全屏播放 / 隐藏菜单", for: .normal)
+        fullscreenButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        fullscreenButton.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
+        controls.addArrangedSubview(fullscreenButton)
         let buttons = UIStackView()
         buttons.axis = .horizontal
         buttons.spacing = 12
@@ -197,15 +215,96 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             panel.bottomAnchor.constraint(equalTo: safe.bottomAnchor),
             panel.widthAnchor.constraint(equalTo: safe.widthAnchor, multiplier: 0.38)
         ]
+        fullscreenConstraints = [
+            video.topAnchor.constraint(equalTo: view.topAnchor),
+            video.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            video.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            video.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            panel.topAnchor.constraint(equalTo: view.bottomAnchor),
+            panel.leadingAnchor.constraint(equalTo: safe.leadingAnchor),
+            panel.trailingAnchor.constraint(equalTo: safe.trailingAnchor),
+            panel.heightAnchor.constraint(equalTo: safe.heightAnchor)
+        ]
+        buildFullscreenHUD()
         updateLayout(for: view.bounds.size)
         updatePlayButton()
     }
 
-    private func updateLayout(for size: CGSize) {
+    private func buildFullscreenHUD() {
+        fullscreenHUD.axis = .horizontal
+        fullscreenHUD.spacing = 12
+        fullscreenHUD.distribution = .fillEqually
+        fullscreenHUD.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        fullscreenHUD.layer.cornerRadius = 12
+        fullscreenHUD.isLayoutMarginsRelativeArrangement = true
+        fullscreenHUD.layoutMargins = UIEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
+        fullscreenHUD.translatesAutoresizingMaskIntoConstraints = false
+        let exitButton = UIButton(type: .system)
+        exitButton.setTitle("退出全屏 / 菜单", for: .normal)
+        exitButton.accessibilityLabel = "退出全屏并显示画面调节菜单"
+        exitButton.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
+        fullscreenPlayButton.addTarget(self, action: #selector(fullscreenTogglePlay), for: .touchUpInside)
+        for button in [exitButton, fullscreenPlayButton] {
+            button.tintColor = .white
+            button.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+            fullscreenHUD.addArrangedSubview(button)
+        }
+        view.addSubview(fullscreenHUD)
+        NSLayoutConstraint.activate([
+            fullscreenHUD.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            fullscreenHUD.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            fullscreenHUD.widthAnchor.constraint(equalToConstant: 280)
+        ])
+        fullscreenHUD.isHidden = true
+        let tap = UITapGestureRecognizer(target: self, action: #selector(videoTapped))
+        video.addGestureRecognizer(tap)
+        video.accessibilityLabel = "视频画面"
+        video.accessibilityHint = "轻点切换全屏操作按钮；退出全屏可显示调节菜单"
+    }
+
+    @objc private func toggleFullscreen() {
+        isFullscreen.toggle()
+        panel.isHidden = isFullscreen
+        updateLayout(for: view.bounds.size, force: true)
+        setNeedsStatusBarAppearanceUpdate()
+        setFullscreenHUDVisible(isFullscreen)
+        view.layoutIfNeeded()
+        // Resize the existing Metal surface without reloading or restarting playback.
+        video.setNeedsLayout()
+        video.layoutIfNeeded()
+    }
+
+    @objc private func videoTapped() {
+        if isFullscreen {
+            setFullscreenHUDVisible(fullscreenHUD.isHidden)
+        } else {
+            toggleFullscreen()
+        }
+    }
+
+    @objc private func fullscreenTogglePlay() {
+        togglePlay()
+        setFullscreenHUDVisible(true)
+    }
+
+    private func setFullscreenHUDVisible(_ visible: Bool) {
+        hideHUDTimer?.invalidate()
+        hideHUDTimer = nil
+        fullscreenHUD.isHidden = !isFullscreen || !visible
+        setNeedsUpdateOfHomeIndicatorAutoHidden()
+        // Keep controls available to VoiceOver users.
+        guard isFullscreen, visible, !UIAccessibility.isVoiceOverRunning else { return }
+        hideHUDTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
+            self?.setFullscreenHUDVisible(false)
+        }
+    }
+
+    private func updateLayout(for size: CGSize, force: Bool = false) {
         let wide = size.width > size.height
-        guard wide != isWide else { return }
-        NSLayoutConstraint.deactivate(portrait + landscape)
-        NSLayoutConstraint.activate(wide ? landscape : portrait)
+        guard force || wide != isWide else { return }
+        NSLayoutConstraint.deactivate(portrait + landscape + fullscreenConstraints)
+        NSLayoutConstraint.activate(isFullscreen ? fullscreenConstraints : (wide ? landscape : portrait))
         isWide = wide
     }
 
@@ -416,7 +515,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     @objc private func showDiagnostics() {
         let details = ([playbackError].compactMap { $0 } + recentErrors).joined(separator: "\n")
         let message = details.isEmpty ? (status.text ?? "尚未记录错误") : details
-        let alert = UIAlertController(title: "播放诊断 · 1.0.2", message: message, preferredStyle: .alert)
+        let alert = UIAlertController(title: "播放诊断 · 1.0.3", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "复制", style: .default) { _ in UIPasteboard.general.string = message })
         alert.addAction(UIAlertAction(title: "关闭", style: .cancel))
         present(alert, animated: true)
@@ -470,7 +569,9 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
 
     private func updatePlayButton() {
         playButton.isEnabled = hasFile
+        fullscreenPlayButton.isEnabled = hasFile
         playButton.setTitle(reachedEnd ? "Replay / 重播" : (isPaused ? "Play / 播放" : "Pause / 暂停"), for: .normal)
+        fullscreenPlayButton.setTitle(playButton.title(for: .normal), for: .normal)
         UIApplication.shared.isIdleTimerDisabled = hasFile && !isPaused && !reachedEnd && !backgrounded
     }
 
@@ -564,12 +665,14 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     }
 
     private func showError(_ message: String) {
+        if isFullscreen { toggleFullscreen() }
         playbackError = message
         status.text = message + "（可点“查看播放错误”复制详情）"
         status.textColor = .systemOrange
     }
 
     deinit {
+        hideHUDTimer?.invalidate()
         timer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         if let mpv { mpv_terminate_destroy(mpv) }
