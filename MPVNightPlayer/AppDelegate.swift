@@ -13,4 +13,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         self.window = window
         return true
     }
+    func application(_ app: UIApplication, open url: URL,
+                     options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        guard let player = window?.rootViewController as? PlayerViewController else { return false }
+        return player.openExternalVideo(url)
+    }
 }

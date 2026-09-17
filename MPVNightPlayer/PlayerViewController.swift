@@ -111,7 +111,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             controls.widthAnchor.constraint(equalTo: panel.frameLayoutGuide.widthAnchor, constant: -32)
         ])
         let title = UILabel()
-        title.text = "MPV Night Player 1.0.1"
+        title.text = "MPV Night Player 1.0.2"
         title.font = .systemFont(ofSize: 22, weight: .bold)
         controls.addArrangedSubview(title)
         filename.text = "打开本地视频，调整暗部与色彩"
@@ -253,10 +253,15 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     }
 
     @objc private func openVideo() {
-        // .data intentionally includes MKV/AVI and files whose provider has no movie UTI.
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.movie, .video, .data], asCopy: false)
+        guard !importInProgress, mpv != nil else { return }
+        // Import mode lets the provider finish downloading/copying before calling us.
+        // .data includes MOV/MKV even when the provider reports only generic data.
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
         picker.delegate = self
         picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        status.text = "等待文件选择器交付视频；云端文件请先下载完成"
+        status.textColor = .secondaryLabel
         present(picker, animated: true)
     }
 
@@ -293,20 +298,48 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         }
     }
 
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        status.text = "已取消文件选择"
+        status.textColor = .secondaryLabel
+    }
+
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        guard let url = urls.first, mpv != nil, !importInProgress else { return }
-        beginImport("正在导入视频；大文件或云端文件可能需要稍候…")
+        controller.dismiss(animated: true)
+        guard let url = urls.first else {
+            showError("文件选择器未返回文件，请尝试在“文件”App 中分享给 MPV Night Player")
+            return
+        }
+        // asCopy:true gives us a local copy; do not ask the provider to coordinate it again.
+        importFile(url, coordinate: false)
+    }
+
+    func openExternalVideo(_ url: URL) -> Bool {
+        loadViewIfNeeded()
+        guard url.isFileURL, mpv != nil, !importInProgress else { return false }
+        if presentedViewController != nil { dismiss(animated: true) }
+        importFile(url, coordinate: true)
+        return true
+    }
+
+    private func importFile(_ url: URL, coordinate: Bool) {
+        guard mpv != nil, !importInProgress else { return }
+        beginImport("已收到文件：\(url.lastPathComponent)，正在导入…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            var coordinationError: NSError?
-            var imported: Result<URL, Error>?
-            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readableURL in
-                imported = Result { try Self.copyForPlayback(readableURL) }
+            let result: Result<URL, Error>
+            if coordinate {
+                var coordinationError: NSError?
+                var imported: Result<URL, Error>?
+                NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readableURL in
+                    imported = Result { try Self.copyForPlayback(readableURL) }
+                }
+                result = imported ?? .failure(coordinationError ?? NSError(domain: NSCocoaErrorDomain,
+                    code: CocoaError.fileReadUnknown.rawValue))
+            } else {
+                result = Result { try Self.copyForPlayback(url) }
             }
-            let result = imported ?? .failure(coordinationError ?? NSError(domain: NSCocoaErrorDomain,
-                code: CocoaError.fileReadUnknown.rawValue))
             DispatchQueue.main.async {
                 switch result {
                 case .success(let local): self.finishImport(local, name: url.lastPathComponent)
@@ -383,7 +416,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     @objc private func showDiagnostics() {
         let details = ([playbackError].compactMap { $0 } + recentErrors).joined(separator: "\n")
         let message = details.isEmpty ? (status.text ?? "尚未记录错误") : details
-        let alert = UIAlertController(title: "播放诊断 · 1.0.1", message: message, preferredStyle: .alert)
+        let alert = UIAlertController(title: "播放诊断 · 1.0.2", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "复制", style: .default) { _ in UIPasteboard.general.string = message })
         alert.addAction(UIAlertAction(title: "关闭", style: .cancel))
         present(alert, animated: true)
