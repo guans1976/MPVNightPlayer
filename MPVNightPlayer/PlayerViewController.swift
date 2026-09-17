@@ -36,6 +36,8 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     private let shadowSlider = UISlider()
     private let detailSlider = UISlider()
     private let enhancementSummary = UILabel()
+    private var bypassDenoise = false
+    private var denoiseCompareButtons: [UIButton] = []
     private var comparingOriginal = false
     private var compareButtons: [UIButton] = []
     private var enhancementReady = false
@@ -144,7 +146,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             controls.widthAnchor.constraint(equalTo: panel.frameLayoutGuide.widthAnchor, constant: -32)
         ])
         let title = UILabel()
-        title.text = "MPV Night Player 1.0.5"
+        title.text = "MPV Night Player 1.0.6"
         title.font = .systemFont(ofSize: 22, weight: .bold)
         controls.addArrangedSubview(title)
         filename.text = "打开本地视频，调整暗部与色彩"
@@ -280,6 +282,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         }
         fullscreenHUD.addArrangedSubview(buttonRow)
         fullscreenHUD.addArrangedSubview(makeTimeline())
+        fullscreenHUD.addArrangedSubview(makeDenoiseCompareButton())
         fullscreenHUD.addArrangedSubview(makeCompareButton())
         view.addSubview(fullscreenHUD)
         NSLayoutConstraint.activate([
@@ -726,6 +729,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     }
 
     @objc private func resetImage() {
+        bypassDenoise = false
         comparingOriginal = false
         denoiseControl.selectedSegmentIndex = 0
         shadowSlider.value = 0
@@ -773,7 +777,23 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         preset.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
         preset.addTarget(self, action: #selector(nightPreset), for: .touchUpInside)
         controls.addArrangedSubview(preset)
+        controls.addArrangedSubview(makeDenoiseCompareButton())
         controls.addArrangedSubview(makeCompareButton())
+    }
+
+    private func makeDenoiseCompareButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        button.addTarget(self, action: #selector(toggleDenoiseComparison), for: .touchUpInside)
+        button.accessibilityHint = "只切换降噪，保持亮度、暗部增强和清晰度相同"
+        denoiseCompareButtons.append(button)
+        return button
+    }
+
+    @objc private func toggleDenoiseComparison() {
+        bypassDenoise.toggle()
+        applyEnhancement()
+        if isFullscreen { setFullscreenHUDVisible(true) }
     }
 
     private func makeCompareButton() -> UIButton {
@@ -820,9 +840,13 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         if isFullscreen { setFullscreenHUDVisible(true) }
     }
 
-    @objc private func enhancementChanged() { applyEnhancement() }
+    @objc private func enhancementChanged() {
+        bypassDenoise = false
+        applyEnhancement()
+    }
 
     @objc private func nightPreset() {
+        bypassDenoise = false
         comparingOriginal = false
         for slider in sliders { slider.value = 0; adjust(slider) }
         denoiseControl.selectedSegmentIndex = 1
@@ -833,8 +857,8 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
 
     private func applyEnhancement() {
         let level = max(0, min(3, denoiseControl.selectedSegmentIndex))
-        let strengths: [Float] = [0, 0.3, 0.6, 1]
-        let noise: Float = comparingOriginal ? 0 : strengths[level]
+        let strengths: [Float] = [0, 0.35, 0.7, 1]
+        let noise: Float = (comparingOriginal || bypassDenoise) ? 0 : strengths[level]
         let shadow: Float = comparingOriginal ? 0 : shadowSlider.value / 100
         let detail: Float = comparingOriginal ? 0 : detailSlider.value / 100
         if enhancementReady {
@@ -845,6 +869,11 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             "降噪：\(label) · 暗部：\(Int(shadowSlider.value)) · 清晰度：\(Int(detailSlider.value))\n强降噪可能损失细节；4K 卡顿或发热时请降低档位。"
         shadowSlider.accessibilityValue = "\(Int(shadowSlider.value))"
         detailSlider.accessibilityValue = "\(Int(detailSlider.value))"
+        for button in denoiseCompareButtons {
+            button.setTitle(bypassDenoise ? "降噪已临时关闭 · 点击恢复" : "只对比降噪 · 点击暂时关闭", for: .normal)
+            button.isEnabled = !comparingOriginal && level > 0
+            button.accessibilityValue = bypassDenoise ? "降噪已临时关闭" : "降噪开启"
+        }
         for button in compareButtons {
             button.setTitle(comparingOriginal ? "原图对比中 · 松手恢复" : "按住看原图", for: .normal)
         }
@@ -855,7 +884,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         do {
             let directory = try FileManager.default.url(for: .applicationSupportDirectory,
                 in: .userDomainMask, appropriateFor: nil, create: true)
-            let url = directory.appendingPathComponent("night-v1.glsl")
+            let url = directory.appendingPathComponent("night-v2.glsl")
             try Self.nightShader.write(to: url, atomically: true, encoding: .utf8)
             guard let mpv else { return }
             let result = mpv_set_property_string(mpv, "glsl-shaders", url.path)
@@ -870,9 +899,9 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         }
     }
 
-    // Original spatial bilateral filter: stronger chroma smoothing, conservative
-    // luma smoothing. No temporal history, CPU frame copies or external model.
-    // MAIN runs on source-sized RGB; OUTPUT adjusts shadows after color management.
+    // Edge-aware RGB spatial filtering; 3x3 / 5x5 / 7x7 support.
+    // Luma and chroma differences reject samples across visible edges.
+    // No temporal history or CPU frame copies. HDR thresholds need device testing.
     private static let nightShader = """
     //!PARAM night_noise
     //!TYPE DYNAMIC float
@@ -894,29 +923,37 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
 
     //!HOOK MAIN
     //!BIND HOOKED
-    //!DESC Night spatial denoise
+    //!DESC Night wide spatial denoise
     //!WHEN night_noise 0 >
     vec4 hook() {
         vec4 c = HOOKED_tex(HOOKED_pos);
         vec3 luma = vec3(0.2126, 0.7152, 0.0722);
         float y = dot(c.rgb, luma);
-        float sigma = mix(0.025, 0.09, night_noise);
+        vec3 centerChroma = c.rgb - vec3(y);
+        int radius = night_noise < 0.5 ? 1 : (night_noise < 0.85 ? 2 : 3);
+        float sigma = night_noise < 0.5 ? 0.05 : (night_noise < 0.85 ? 0.085 : 0.12);
+        float spatialSigma = float(radius) * 0.8;
+        float lumaBlend = night_noise < 0.5 ? 0.45 : (night_noise < 0.85 ? 0.75 : 0.95);
+        float chromaBlend = night_noise < 0.5 ? 0.65 : (night_noise < 0.85 ? 0.9 : 1.0);
         vec3 total = vec3(0.0);
         float weights = 0.0;
-        for (int j = -1; j <= 1; j++) {
-            for (int i = -1; i <= 1; i++) {
+        for (int j = -radius; j <= radius; j++) {
+            for (int i = -radius; i <= radius; i++) {
                 vec3 p = HOOKED_tex(HOOKED_pos + vec2(float(i), float(j)) * HOOKED_pt).rgb;
-                float delta = dot(p, luma) - y;
-                float spatial = (i == 0 ? 2.0 : 1.0) * (j == 0 ? 2.0 : 1.0);
-                float w = spatial * exp(-delta * delta / (2.0 * sigma * sigma));
+                float py = dot(p, luma);
+                float delta = py - y;
+                vec3 dc = (p - vec3(py)) - centerChroma;
+                float distanceSquared = delta * delta + 0.25 * dot(dc, dc);
+                float spatial = float(i * i + j * j) / (2.0 * spatialSigma * spatialSigma);
+                float w = exp(-spatial - distanceSquared / (2.0 * sigma * sigma));
                 total += p * w;
                 weights += w;
             }
         }
         vec3 avg = total / max(weights, 0.0001);
         float ay = dot(avg, luma);
-        float outY = mix(y, ay, 0.55 * night_noise);
-        vec3 chroma = mix(c.rgb - vec3(y), avg - vec3(ay), 0.85 * night_noise);
+        float outY = mix(y, ay, lumaBlend);
+        vec3 chroma = mix(centerChroma, avg - vec3(ay), chromaBlend);
         return vec4(max(vec3(outY) + chroma, vec3(0.0)), c.a);
     }
 
@@ -1041,6 +1078,8 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
 
     @objc private func enterBackground() {
         compareEnded()
+        bypassDenoise = false
+        applyEnhancement()
         backgrounded = true
         resizeWork?.cancel()
         setString("pause", "yes")
