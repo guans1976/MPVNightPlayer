@@ -32,6 +32,13 @@ final class VideoView: UIView {
 }
 
 final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PHPickerViewControllerDelegate {
+    private let denoiseControl = UISegmentedControl(items: ["关", "低", "中", "高"])
+    private let shadowSlider = UISlider()
+    private let detailSlider = UISlider()
+    private let enhancementSummary = UILabel()
+    private var comparingOriginal = false
+    private var compareButtons: [UIButton] = []
+    private var enhancementReady = false
     private let video = VideoView()
     private let panel = UIScrollView()
     private let controls = UIStackView()
@@ -137,7 +144,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             controls.widthAnchor.constraint(equalTo: panel.frameLayoutGuide.widthAnchor, constant: -32)
         ])
         let title = UILabel()
-        title.text = "MPV Night Player 1.0.4"
+        title.text = "MPV Night Player 1.0.5"
         title.font = .systemFont(ofSize: 22, weight: .bold)
         controls.addArrangedSubview(title)
         filename.text = "打开本地视频，调整暗部与色彩"
@@ -172,6 +179,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         diagnostics.setTitle("查看播放错误", for: .normal)
         diagnostics.addTarget(self, action: #selector(showDiagnostics), for: .touchUpInside)
         controls.addArrangedSubview(diagnostics)
+        buildEnhancementControls()
         for index in properties.indices {
             let row = UIStackView()
             row.axis = .horizontal
@@ -272,6 +280,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         }
         fullscreenHUD.addArrangedSubview(buttonRow)
         fullscreenHUD.addArrangedSubview(makeTimeline())
+        fullscreenHUD.addArrangedSubview(makeCompareButton())
         view.addSubview(fullscreenHUD)
         NSLayoutConstraint.activate([
             fullscreenHUD.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
@@ -318,7 +327,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         fullscreenHUD.isHidden = !isFullscreen || !visible
         setNeedsUpdateOfHomeIndicatorAutoHidden()
         // Keep controls available to VoiceOver users.
-        guard isFullscreen, visible, !scrubbing, !isPaused, !UIAccessibility.isVoiceOverRunning else { return }
+        guard isFullscreen, visible, !scrubbing, !comparingOriginal, !isPaused, !UIAccessibility.isVoiceOverRunning else { return }
         hideHUDTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
             self?.setFullscreenHUDVisible(false)
         }
@@ -485,6 +494,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
             return
         }
         mpv_request_log_messages(handle, "warn")
+        installEnhancementShader()
         mpv_observe_property(handle, 1, "pause", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 2, "eof-reached", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 3, "time-pos", MPV_FORMAT_DOUBLE)
@@ -712,15 +722,233 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
         let value = Int(slider.value.rounded())
         values[slider.tag].text = "\(value)"
         slider.accessibilityValue = "\(value)"
-        setString(properties[slider.tag], "\(value)")
+        setString(properties[slider.tag], comparingOriginal ? "0" : "\(value)")
     }
 
     @objc private func resetImage() {
+        comparingOriginal = false
+        denoiseControl.selectedSegmentIndex = 0
+        shadowSlider.value = 0
+        detailSlider.value = 0
+        applyEnhancement()
         for slider in sliders {
             slider.value = 0
             adjust(slider)
         }
     }
+
+
+    private func buildEnhancementControls() {
+        let heading = UILabel()
+        heading.text = "夜景画质 · 试用版"
+        heading.font = .systemFont(ofSize: 18, weight: .semibold)
+        controls.addArrangedSubview(heading)
+        let noiseLabel = UILabel()
+        noiseLabel.text = "降噪（建议先试低档）"
+        noiseLabel.font = .systemFont(ofSize: 14)
+        controls.addArrangedSubview(noiseLabel)
+        denoiseControl.selectedSegmentIndex = 1
+        denoiseControl.accessibilityLabel = "降噪强度"
+        denoiseControl.addTarget(self, action: #selector(enhancementChanged), for: .valueChanged)
+        controls.addArrangedSubview(denoiseControl)
+        for (labelText, slider) in [("暗部增强", shadowSlider), ("清晰度", detailSlider)] {
+            let label = UILabel()
+            label.text = labelText
+            label.font = .systemFont(ofSize: 14)
+            controls.addArrangedSubview(label)
+            slider.minimumValue = 0
+            slider.maximumValue = 100
+            slider.value = 0
+            slider.accessibilityLabel = labelText
+            slider.addTarget(self, action: #selector(enhancementChanged), for: .valueChanged)
+            controls.addArrangedSubview(slider)
+        }
+        enhancementSummary.font = .systemFont(ofSize: 12)
+        enhancementSummary.textColor = .secondaryLabel
+        enhancementSummary.numberOfLines = 0
+        controls.addArrangedSubview(enhancementSummary)
+        let preset = UIButton(type: .system)
+        preset.setTitle("一键夜景：低降噪 + 适度暗部增强", for: .normal)
+        preset.titleLabel?.font = .systemFont(ofSize: 14)
+        preset.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        preset.addTarget(self, action: #selector(nightPreset), for: .touchUpInside)
+        controls.addArrangedSubview(preset)
+        controls.addArrangedSubview(makeCompareButton())
+    }
+
+    private func makeCompareButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle("按住看原图", for: .normal)
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        button.addTarget(self, action: #selector(compareBegan), for: .touchDown)
+        button.addTarget(self, action: #selector(compareReleased), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
+        button.accessibilityHint = "按住暂时关闭全部画面调节，松手恢复；VoiceOver 双击切换"
+        button.accessibilityCustomActions = [
+            UIAccessibilityCustomAction(name: "切换原图对比", target: self, selector: #selector(accessibleCompare))
+        ]
+        // VoiceOver activation sends touchUpInside without touchDown.
+        button.addTarget(self, action: #selector(compareActivated), for: .primaryActionTriggered)
+        compareButtons.append(button)
+        return button
+    }
+
+    @objc private func compareReleased() {
+        if !UIAccessibility.isVoiceOverRunning { compareEnded() }
+    }
+
+    @objc private func compareActivated() {
+        if UIAccessibility.isVoiceOverRunning { _ = accessibleCompare() }
+    }
+
+    @objc private func accessibleCompare() -> Bool {
+        if comparingOriginal { compareEnded() } else { compareBegan() }
+        return true
+    }
+
+    @objc private func compareBegan() {
+        comparingOriginal = true
+        hideHUDTimer?.invalidate()
+        for property in properties { setString(property, "0") }
+        applyEnhancement()
+    }
+
+    @objc private func compareEnded() {
+        guard comparingOriginal else { return }
+        comparingOriginal = false
+        for slider in sliders { adjust(slider) }
+        applyEnhancement()
+        if isFullscreen { setFullscreenHUDVisible(true) }
+    }
+
+    @objc private func enhancementChanged() { applyEnhancement() }
+
+    @objc private func nightPreset() {
+        comparingOriginal = false
+        for slider in sliders { slider.value = 0; adjust(slider) }
+        denoiseControl.selectedSegmentIndex = 1
+        shadowSlider.value = 35
+        detailSlider.value = 0
+        applyEnhancement()
+    }
+
+    private func applyEnhancement() {
+        let level = max(0, min(3, denoiseControl.selectedSegmentIndex))
+        let strengths: [Float] = [0, 0.3, 0.6, 1]
+        let noise: Float = comparingOriginal ? 0 : strengths[level]
+        let shadow: Float = comparingOriginal ? 0 : shadowSlider.value / 100
+        let detail: Float = comparingOriginal ? 0 : detailSlider.value / 100
+        if enhancementReady {
+            setString("glsl-shader-opts", "night_noise=\(noise),night_shadow=\(shadow),night_detail=\(detail)")
+        }
+        let label = ["关", "低", "中", "高"][level]
+        enhancementSummary.text = comparingOriginal ? "正在看原图 · 松手恢复" :
+            "降噪：\(label) · 暗部：\(Int(shadowSlider.value)) · 清晰度：\(Int(detailSlider.value))\n强降噪可能损失细节；4K 卡顿或发热时请降低档位。"
+        shadowSlider.accessibilityValue = "\(Int(shadowSlider.value))"
+        detailSlider.accessibilityValue = "\(Int(detailSlider.value))"
+        for button in compareButtons {
+            button.setTitle(comparingOriginal ? "原图对比中 · 松手恢复" : "按住看原图", for: .normal)
+        }
+    }
+
+    private func installEnhancementShader() {
+        enhancementReady = false
+        do {
+            let directory = try FileManager.default.url(for: .applicationSupportDirectory,
+                in: .userDomainMask, appropriateFor: nil, create: true)
+            let url = directory.appendingPathComponent("night-v1.glsl")
+            try Self.nightShader.write(to: url, atomically: true, encoding: .utf8)
+            guard let mpv else { return }
+            let result = mpv_set_property_string(mpv, "glsl-shaders", url.path)
+            guard result >= 0 else {
+                showMPVError(result, operation: "画质滤镜初始化")
+                return
+            }
+            enhancementReady = true
+            applyEnhancement()
+        } catch {
+            showError("无法准备画质滤镜：\(error.localizedDescription)")
+        }
+    }
+
+    // Original spatial bilateral filter: stronger chroma smoothing, conservative
+    // luma smoothing. No temporal history, CPU frame copies or external model.
+    // MAIN runs on source-sized RGB; OUTPUT adjusts shadows after color management.
+    private static let nightShader = """
+    //!PARAM night_noise
+    //!TYPE DYNAMIC float
+    //!MINIMUM 0
+    //!MAXIMUM 1
+    0.0
+
+    //!PARAM night_shadow
+    //!TYPE DYNAMIC float
+    //!MINIMUM 0
+    //!MAXIMUM 1
+    0.0
+
+    //!PARAM night_detail
+    //!TYPE DYNAMIC float
+    //!MINIMUM 0
+    //!MAXIMUM 1
+    0.0
+
+    //!HOOK MAIN
+    //!BIND HOOKED
+    //!DESC Night spatial denoise
+    //!WHEN night_noise 0 >
+    vec4 hook() {
+        vec4 c = HOOKED_tex(HOOKED_pos);
+        vec3 luma = vec3(0.2126, 0.7152, 0.0722);
+        float y = dot(c.rgb, luma);
+        float sigma = mix(0.025, 0.09, night_noise);
+        vec3 total = vec3(0.0);
+        float weights = 0.0;
+        for (int j = -1; j <= 1; j++) {
+            for (int i = -1; i <= 1; i++) {
+                vec3 p = HOOKED_tex(HOOKED_pos + vec2(float(i), float(j)) * HOOKED_pt).rgb;
+                float delta = dot(p, luma) - y;
+                float spatial = (i == 0 ? 2.0 : 1.0) * (j == 0 ? 2.0 : 1.0);
+                float w = spatial * exp(-delta * delta / (2.0 * sigma * sigma));
+                total += p * w;
+                weights += w;
+            }
+        }
+        vec3 avg = total / max(weights, 0.0001);
+        float ay = dot(avg, luma);
+        float outY = mix(y, ay, 0.55 * night_noise);
+        vec3 chroma = mix(c.rgb - vec3(y), avg - vec3(ay), 0.85 * night_noise);
+        return vec4(max(vec3(outY) + chroma, vec3(0.0)), c.a);
+    }
+
+    //!HOOK MAIN
+    //!BIND HOOKED
+    //!DESC Night gentle detail
+    //!WHEN night_detail 0 >
+    vec4 hook() {
+        vec4 c = HOOKED_tex(HOOKED_pos);
+        vec3 n = HOOKED_tex(HOOKED_pos + vec2(0.0, HOOKED_pt.y)).rgb;
+        vec3 s = HOOKED_tex(HOOKED_pos - vec2(0.0, HOOKED_pt.y)).rgb;
+        vec3 e = HOOKED_tex(HOOKED_pos + vec2(HOOKED_pt.x, 0.0)).rgb;
+        vec3 w = HOOKED_tex(HOOKED_pos - vec2(HOOKED_pt.x, 0.0)).rgb;
+        vec3 low = min(c.rgb, min(min(n, s), min(e, w)));
+        vec3 high = max(c.rgb, max(max(n, s), max(e, w)));
+        vec3 sharpened = c.rgb + (c.rgb - (n + s + e + w) * 0.25) * night_detail * 0.5;
+        return vec4(clamp(sharpened, low, high), c.a);
+    }
+
+    //!HOOK OUTPUT
+    //!BIND HOOKED
+    //!DESC Night protected shadow lift
+    //!WHEN night_shadow 0 >
+    vec4 hook() {
+        vec4 c = HOOKED_tex(HOOKED_pos);
+        float y = max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+        float mask = 1.0 - smoothstep(0.05, 0.65, y);
+        float gain = 1.0 + 1.4 * night_shadow * mask;
+        return vec4(c.rgb * gain, c.a);
+    }
+    """
+
 
     private func updatePlayButton() {
         playButton.isEnabled = hasFile
@@ -745,6 +973,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
                 status.text = "已打开 · 实时调节画面，Reset 恢复为 0"
                 status.textColor = .secondaryLabel
                 for slider in sliders { adjust(slider) }
+                applyEnhancement()
                 updatePlayButton()
             case MPV_EVENT_PROPERTY_CHANGE:
                 guard let data = event.data else { continue }
@@ -811,6 +1040,7 @@ final class PlayerViewController: UIViewController, UIDocumentPickerDelegate, PH
     }
 
     @objc private func enterBackground() {
+        compareEnded()
         backgrounded = true
         resizeWork?.cancel()
         setString("pause", "yes")
